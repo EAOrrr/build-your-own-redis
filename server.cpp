@@ -109,9 +109,10 @@ static struct {
     std::string aof_filename = "redis.aof";
     bool aof_enabled = true;
     // AOF rewrite related
-    uint64_t aof_bytes_since_last_rewrite = 0;
-    uint64_t aof_rewrite_threshold = 64 * 1024 * 1024; // 64MB
-    bool aof_rewrite_in_progress = false;
+    int aof_rewrite_fd = -1;          // 重写AOF文件的文件描述符
+    std::string aof_rewrite_filename; // 重写AOF文件的临时文件名
+    bool aof_rewriting = false;       // 是否正在进行AOF重写
+    size_t aof_rewrite_progress = 0;  // 重写进度 
 } g_data;
 
 
@@ -540,10 +541,199 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
     return out_int(out, (int64_t)added);
 }
 
+static void aof_write_command(Buffer &buf, const std::vector<std::string> &cmd);
+static void aof_flush_and_sync();
+
+// 将条目写入AOF重写文件
+static void aof_rewrite_entry(Entry *ent, int fd) {
+    Buffer buf;
+    
+    if (ent->type == T_STR) {
+        // 为字符串类型构建SET命令
+        std::vector<std::string> cmd = {"set", ent->key, ent->str};
+        aof_write_command(buf, cmd);
+        
+        // 如果有TTL，添加PEXPIRE命令
+        if (ent->heap_idx != (size_t)-1) {
+            int64_t ttl = g_data.heap[ent->heap_idx].val - get_monotonic_msec();
+            if (ttl > 0) {
+                std::vector<std::string> expire_cmd = {
+                    "pexpire", 
+                    ent->key, 
+                    std::to_string(ttl)
+                };
+                aof_write_command(buf, expire_cmd);
+            }
+        }
+        
+        // 写入文件
+        uint8_t *data = NULL;
+        size_t data_size;
+        buf.get_continuous_data(0, &data, &data_size);
+        if (data && data_size > 0) {
+            write(fd, data, data_size);
+        }
+    } else if (ent->type == T_ZSET) {
+        // 为有序集合构建ZADD命令
+        ZSet *zset = &ent->zset;
+        std::string key = ent->key; // 在外部保存key，避免在Lambda中访问可能无效的ent
+        
+        // 遍历有序集合的所有成员
+        struct ForeachData {
+            int fd;
+            std::string key;
+        };
+        
+        ForeachData foreach_data = {fd, key};
+        
+        hm_foreach(&zset->hmap, [](HNode *node, void *arg) {
+            auto *data = static_cast<ForeachData*>(arg);
+            ZNode *znode = container_of(node, ZNode, hmap);
+            
+            // 安全检查
+            if (!znode || znode->len == 0) {
+                return true; // 跳过无效的节点
+            }
+            
+            Buffer cmd_buf;
+            
+            // 安全地创建ZADD命令，确保使用正确的字符串长度
+            std::string name(znode->name, znode->len);
+            std::vector<std::string> cmd = {
+                "zadd", 
+                data->key,
+                std::to_string(znode->score),
+                name
+            };
+            
+            aof_write_command(cmd_buf, cmd);
+            
+            // 写入文件
+            uint8_t *buf_data = NULL;
+            size_t data_size;
+            cmd_buf.get_continuous_data(0, &buf_data, &data_size);
+            if (buf_data && data_size > 0) {
+                write(data->fd, buf_data, data_size);
+            }
+            
+            return true;
+        }, &foreach_data);
+        
+        // 如果有TTL，添加PEXPIRE命令
+        if (ent->heap_idx != (size_t)-1) {
+            Buffer ttl_buf;
+            int64_t ttl = g_data.heap[ent->heap_idx].val - get_monotonic_msec();
+            if (ttl > 0) {
+                std::vector<std::string> expire_cmd = {
+                    "pexpire", 
+                    key,  // 使用保存的key
+                    std::to_string(ttl)
+                };
+                aof_write_command(ttl_buf, expire_cmd);
+                
+                // 写入文件
+                uint8_t *data = NULL;
+                size_t data_size;
+                ttl_buf.get_continuous_data(0, &data, &data_size);
+                if (data && data_size > 0) {
+                    write(fd, data, data_size);
+                }
+            }
+        }
+    }
+}
+
+// 执行AOF重写
+static int32_t aof_rewrite_do() {
+    if (!g_data.aof_rewriting || g_data.aof_rewrite_fd < 0) {
+        return -1;
+    }
+    
+    msg("Rewriting AOF file...");
+    
+    // 遍历数据库中的所有条目
+    size_t total_entries = hm_size(&g_data.db);
+    size_t processed = 0;
+    
+    hm_foreach(&g_data.db, [](HNode *node, void *arg) {
+        Entry *ent = container_of(node, Entry, node);
+        int fd = g_data.aof_rewrite_fd;
+        
+        // 写入条目到AOF重写文件
+        aof_rewrite_entry(ent, fd);
+        
+        return true;
+    }, nullptr);
+    
+    fsync(g_data.aof_rewrite_fd);
+    return 0;
+}
+
+// 完成AOF重写
+static void aof_rewrite_finish() {
+    if (!g_data.aof_rewriting) {
+        return;
+    }
+    
+    msg("Finishing AOF rewrite...");
+    
+    // 关闭临时文件
+    if (g_data.aof_rewrite_fd >= 0) {
+        close(g_data.aof_rewrite_fd);
+        g_data.aof_rewrite_fd = -1;
+    }
+    
+    // 确保AOF缓冲区已刷新
+    aof_flush_and_sync();
+    
+    // 使用临时文件替换原AOF文件
+    if (rename(g_data.aof_rewrite_filename.c_str(), g_data.aof_filename.c_str()) < 0) {
+        msg_errno("rename() error during AOF rewrite");
+        unlink(g_data.aof_rewrite_filename.c_str());
+        g_data.aof_rewriting = false;
+        return;
+    }
+    
+    // 重新打开新的AOF文件
+    close(g_data.aof_fd);
+    g_data.aof_fd = open(g_data.aof_filename.c_str(), O_WRONLY | O_APPEND, 0644);
+    if (g_data.aof_fd < 0) {
+        msg_errno("open() error after AOF rewrite");
+        g_data.aof_enabled = false;
+    } else {
+        fd_set_nb(g_data.aof_fd);
+    }
+    
+    g_data.aof_rewriting = false;
+    msg("AOF rewrite completed");
+}
+
 static int32_t aof_rewrite() {
-    if (g_data.aof_rewrite_in_progress) {
+    if (g_data.aof_rewriting) {
         return -1; // 重写已经在进行中
     }
+    msg("AOF rewrite started");
+    g_data.aof_rewriting = true;
+    g_data.aof_rewrite_progress = 0;
+    g_data.aof_rewrite_filename = g_data.aof_filename + ".temp";
+    // 创建临时AOF文件
+    g_data.aof_rewrite_fd = open(g_data.aof_rewrite_filename.c_str(), 
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (g_data.aof_rewrite_fd < 0) {
+        msg_errno("AOF rewrite open() error");
+        g_data.aof_rewriting = false;
+        return -1;
+    }
+    
+    // 设置为非阻塞模式
+    fd_set_nb(g_data.aof_rewrite_fd);
+    // 在线程池中执行重写任务
+    // thread_pool_queue(&g_data.thread_pool, [](void* arg) {
+    //     aof_rewrite_do();
+    //     aof_rewrite_finish();
+    // }, nullptr);
+    aof_rewrite_do();
+    aof_rewrite_finish();
 
     // todo
     return 0;
@@ -555,7 +745,7 @@ static void do_aof_rewrite(std::vector<std::string> &cmd, Buffer &out) {
         return out_err(out, ERR_BAD_ARG, "AOF is not enabled");
     }
     
-    if (g_data.aof_rewrite_in_progress) {
+    if (g_data.aof_rewriting) {
         return out_err(out, ERR_BAD_ARG, "AOF rewrite already in progress");
     }
     
@@ -786,6 +976,9 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_zscore(cmd, out); // zscore 是只读命令
     } else if (cmd.size() == 6 && cmd[0] == "zquery") {
         return do_zquery(cmd, out); // zquery 是只读命令
+    } else if (cmd.size() == 1 && cmd[0] == "bgrewriteaof") {
+        return do_aof_rewrite(cmd, out);
+
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }

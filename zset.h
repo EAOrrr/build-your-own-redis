@@ -23,3 +23,4 @@ void   zset_delete(ZSet *zset, ZNode *node);
 ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len);
 void   zset_clear(ZSet *zset);
 ZNode *znode_offset(ZNode *node, int64_t offset);
+void zset_foreach(ZSet *zset, bool (*f)(ZNode *, void *), void *arg);

@@ -166,3 +166,29 @@ void zset_clear(ZSet *zset) {
     tree_dispose(zset->root);
     zset->root = NULL;
 }
+
+// traverse the AVL tree in-order and apply the function to each node
+static bool tree_foreach(AVLNode *node, bool (*f)(ZNode *, void *), void *arg) {
+    if (!node) {
+        return true;
+    }
+    
+    // Traverse left subtree
+    if (!tree_foreach(node->left, f, arg)) {
+        return false;
+    }
+    
+    // Process current node
+    ZNode *znode = container_of(node, ZNode, tree);
+    if (!f(znode, arg)) {
+        return false;
+    }
+    
+    // Traverse right subtree
+    return tree_foreach(node->right, f, arg);
+}
+
+// apply the function to each node in the zset, in order of (score, name)
+void zset_foreach(ZSet *zset, bool (*f)(ZNode *, void *), void *arg) {
+    tree_foreach(zset->root, f, arg);
+}
