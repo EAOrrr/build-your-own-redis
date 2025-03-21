@@ -1,20 +1,13 @@
-CXX = g++
-CXXFLAGS = 
-TARGET = redis-server
+all: server client
 
-# Find all cpp files
-SRCS = $(wildcard *.cpp)
-OBJS = $(SRCS:.cpp=.o)
+server:
+	cd server && $(MAKE)
 
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CXX) $(OBJS) -o $(TARGET)
-
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+client:
+	g++ -o redis-client ./client/client.cpp
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	cd server && $(MAKE) clean
+	rm -f redis-client
 
-.PHONY: all clean
+.PHONY: all server client clean
